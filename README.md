@@ -14,6 +14,8 @@ To run the script, simply set the environment variables (Tenant ID, Client ID, C
 
 
 // TR
+
+
 Microsoft Defender dosya olaylarını raporlayan otomasyon scripti
 Bu repository, Microsoft Defender for Endpoint ortamında cihazlarda gerçekleşen dosya işlemlerini (oluşturma, silme, kopyalama, değiştirme) otomatik olarak toplayan ve raporlayan bir PowerShell scripti içerir. Amaç:
 
