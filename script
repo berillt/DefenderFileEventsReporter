@@ -1,0 +1,198 @@
+# ============================================================
+# Defender File Events Report Script
+# Version: 1.0.0
+# Author: Beril Töman
+# Description:
+#   - Pulls DeviceFileEvents from Defender for Endpoint
+#   - Generates per-device CSVs for the last 7 days
+#   - Bundles CSVs into a ZIP
+#   - Sends ZIP via Graph API mail
+# ============================================================
+
+# ================================
+# Defender File Event Report Script (Graph API Mail + Zip) - with Retry and Delay 
+# ================================
+
+# ---  (Azure App Registration) ---
+$TenantId     = "YOUR_TENANT_ID"  #EDIT
+$ClientId     = "YOUR_CLIENT_ID"  #EDIT
+$ClientSecret = "YOUR_CLIENT_SECRET"  #EDIT
+
+# --- REPORTS ---
+$ReportFolder = "C:\Reports"  #EDIT
+$ZipPath      = "$ReportFolder\FileEvents_Full.zip"  #EDIT
+$MailFrom     = "send@domain.com"  #EDIT
+$MailTo       = "receive@domain.com"  #EDIT
+
+# --- USER IST ---
+$Devices = @(
+    "device_name",  #EDIT
+    "device_name",  #EDIT
+    ...
+)
+
+Write-Host "starting" -ForegroundColor Cyan
+
+# --- Defender token ---
+try {
+    $BodyDefender = @{
+        grant_type    = "client_credentials"
+        client_id     = $ClientId
+        client_secret = $ClientSecret
+        scope         = "https://api.security.microsoft.com/.default"
+    }
+    $DefenderToken = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" -Body $BodyDefender -ErrorAction Stop
+    $DefenderHeader = @{ Authorization = "Bearer $($DefenderToken.access_token)" }
+    Write-Host "Defender Token is successful" -ForegroundColor Green
+}
+catch {
+    Write-Host "Defender token error $($_.Exception.Message)" -ForegroundColor Red
+    return
+}
+
+# --- Graph token ---
+try {
+    $BodyGraph = @{
+        grant_type    = "client_credentials"
+        client_id     = $ClientId
+        client_secret = $ClientSecret
+        scope         = "https://graph.microsoft.com/.default"
+    }
+    $GraphToken = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" -Body $BodyGraph -ErrorAction Stop
+    $GraphHeader = @{ Authorization = "Bearer $($GraphToken.access_token)"; "Content-Type"="application/json" }
+    Write-Host "Graph token success" -ForegroundColor Green
+}
+catch {
+    Write-Host "Graph token error: $($_.Exception.Message)" -ForegroundColor Red
+    return
+}
+
+# --- API Retry ---
+function Invoke-DefenderQuery {
+    param ($BodyJson)
+    $maxRetry = 5
+    $retryDelay = 10  # second
+
+    for ($attempt=1; $attempt -le $maxRetry; $attempt++) {
+        try {
+            $Response = Invoke-RestMethod -Method Post -Uri "https://api.security.microsoft.com/api/advancedhunting/run" -Headers $DefenderHeader -Body $BodyJson -ContentType "application/json" -ErrorAction Stop
+            return $Response
+        }
+        catch {
+            if ($_.Exception.Message -like "*429*") {
+                Write-Host " 429 Too Many Requests, $retryDelay delay waitin (Retry $attempt/$maxRetry)"
+                Start-Sleep -Seconds $retryDelay
+            }
+            else {
+                throw $_
+            }
+        }
+    }
+    Write-Host " Max retry error."
+    return $null
+}
+
+# --- Reports creation ---
+$CsvFiles = @()
+
+foreach ($Device in $Devices) {
+
+    $AllResults = @()
+
+    for ($i=7; $i -ge 1; $i--) {
+
+        $StartTime = (Get-Date).AddDays(-$i).ToString("yyyy-MM-dd")
+        $EndTime   = (Get-Date).AddDays(-($i-1)).ToString("yyyy-MM-dd")
+
+        Write-Host "Results: $Device | $StartTime - $EndTime"
+
+        $Query = @"
+DeviceFileEvents
+| where Timestamp >= datetime($StartTime) and Timestamp < datetime($EndTime)
+| where ActionType in ("FileCreated", "FileDeleted", "FileModified", "FileCopied")
+| where DeviceName in~ ("$Device")
+| extend
+    EventCategory = case(
+    ActionType == "FileCreated", "CREATED",
+    ActionType == "FileDeleted", "DELETED",
+    ActionType == "FileModified", "MODIFIED",
+    ActionType == "FileCopied",  "COPIED",
+    AdditionalFields has "RemovableMedia", "USB copy",
+    "OTHER"
+)
+| project
+    DeviceId, ReportId, Timestamp, DeviceName, InitiatingProcessAccountName, InitiatingProcessFileName,
+    FileName, FolderPath, ActionType, EventCategory, InitiatingProcessCommandLine
+| sort by Timestamp desc
+"@
+
+        $BodyJson = @{ Query = $Query } | ConvertTo-Json -Depth 5
+
+        $Response = Invoke-DefenderQuery -BodyJson $BodyJson
+
+        if ($Response -ne $null -and $Response.Results) {
+            $AllResults += $Response.Results
+            Write-Host "Success: $($Response.Results.Count) " -ForegroundColor Green
+        }
+        else {
+            Write-Host "$StartTime - $EndTime no error" -ForegroundColor Yellow
+        }
+
+        Start-Sleep -Seconds 3  
+    }
+
+    # --- CSV create ---
+    if ($AllResults.Count -gt 0) {
+        if (!(Test-Path $ReportFolder)) { New-Item -ItemType Directory -Path $ReportFolder | Out-Null }
+        $CsvPath = "$ReportFolder\FileEvents_$Device.csv"  #EDIT
+        $AllResults | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+        Write-Host "Created CSV: $CsvPath" -ForegroundColor Green
+        $CsvFiles += $CsvPath
+    }
+    else {
+        Write-Host " $Device no data" -ForegroundColor Yellow
+    }
+
+    Start-Sleep -Seconds 5  
+}
+
+# --- CSV zip ---
+if ($CsvFiles.Count -gt 0) {
+    if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
+    Compress-Archive -Path $CsvFiles -DestinationPath $ZipPath -Force
+    Write-Host "CSV's ZIPing: $ZipPath" -ForegroundColor Green
+}
+else {
+    Write-Host "Any CSV." -ForegroundColor Yellow
+    return
+}
+
+# --- Graph API mail sending (ZIP attachment + CC) ---
+$MailBody = @{
+    message = @{
+        subject = "SUBJECT"  #EDIT
+        body = @{
+            contentType = "HTML"
+            content = "Hello World..."  #EDIT
+        }
+        toRecipients = @(@{ emailAddress = @{ address = $MailTo } })
+       
+        attachments = @(
+            @{
+                "@odata.type" = "#microsoft.graph.fileAttachment"
+                name           = [System.IO.Path]::GetFileName($ZipPath)
+                contentBytes   = [System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($ZipPath))
+            }
+        )
+    }
+} | ConvertTo-Json -Depth 10
+
+try {
+    $SendMail = Invoke-RestMethod -Method Post -Uri "https://graph.microsoft.com/v1.0/users/$MailFrom/sendMail" -Headers $GraphHeader -Body $MailBody -ErrorAction Stop
+    Write-Host "Send mail: $MailFrom → $MailTo" -ForegroundColor Cyan
+}
+catch {
+    Write-Host "Mail error: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+Write-Host "Script completed." -ForegroundColor Cyan
